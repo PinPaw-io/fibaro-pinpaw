@@ -1,0 +1,245 @@
+{
+  "apiVersion": "1.3",
+  "files": [
+    {
+      "content": "--[[\nThin PinPaw REST client for Fibaro HC3 QuickApps.\n\nMirrors custom_components/pinpaw/api.py from the Home Assistant integration:\nonly the endpoints the integration needs are wrapped, and authentication uses\na long-lived personal access token (\"ppw_pat_...\") sent as a Bearer credential.\n\nHC3's net.HTTPClient is callback-based, so every call takes an onSuccess and an\nonError callback instead of returning a value. onError receives a machine\nreadable kind (\"auth\" | \"http\" | \"network\" | \"parse\") so the caller can react\ndifferently to a rejected token than to a flaky network -- the QuickApp stops\npolling on \"auth\" rather than hammering the API with a credential it knows is\nbad.\n]]\n\nPinPawApi = {}\nPinPawApi.__index = PinPawApi\n\n-- A PinPaw personal access token always carries this prefix.\nPINPAW_TOKEN_PREFIX = \"ppw_pat_\"\n\nPINPAW_DEFAULT_BASE_URL = \"https://api.pinpaw.io\"\n\nlocal HTTP_TIMEOUT_MS = 15000\n\n--- Create a client. `logger` is optional and only needs a :debug(...) method.\nfunction PinPawApi.new(baseUrl, token, logger)\n  local self = setmetatable({}, PinPawApi)\n  self.baseUrl = (baseUrl or PINPAW_DEFAULT_BASE_URL):gsub(\"/+$\", \"\")\n  self.token = token or \"\"\n  self.logger = logger\n  self.http = net.HTTPClient({ timeout = HTTP_TIMEOUT_MS })\n  return self\nend\n\n--- True when the token at least looks like a PinPaw PAT.\n--- Cheap local check so an obvious typo is reported before any network call,\n--- matching the Home Assistant config flow.\nfunction PinPawApi.looksLikeToken(token)\n  return type(token) == \"string\" and token:sub(1, #PINPAW_TOKEN_PREFIX) == PINPAW_TOKEN_PREFIX\nend\n\nfunction PinPawApi:_debug(message)\n  if self.logger and self.logger.debug then\n    self.logger:debug(message)\n  end\nend\n\nfunction PinPawApi:_request(method, path, body, onSuccess, onError)\n  local headers = {\n    [\"Authorization\"] = \"Bearer \" .. self.token,\n    [\"Accept\"] = \"application/json\",\n  }\n\n  local options = { method = method, headers = headers, timeout = HTTP_TIMEOUT_MS }\n  if body ~= nil then\n    headers[\"Content-Type\"] = \"application/json\"\n    options.data = json.encode(body)\n  end\n\n  self:_debug(string.format(\"%s %s\", method, path))\n\n  self.http:request(self.baseUrl .. path, {\n    options = options,\n    success = function(response)\n      local status = tonumber(response and response.status) or 0\n\n      if status == 401 or status == 403 then\n        onError(\"auth\", string.format(\"token rejected (HTTP %d)\", status))\n        return\n      end\n      if status < 200 or status >= 300 then\n        onError(\"http\", string.format(\"%s %s -> HTTP %d\", method, path, status))\n        return\n      end\n\n      -- 204 No Content, or an empty body on a 200: nothing to decode.\n      if status == 204 or response.data == nil or response.data == \"\" then\n        onSuccess(nil)\n        return\n      end\n\n      local ok, decoded = pcall(json.decode, response.data)\n      if not ok then\n        onError(\"parse\", string.format(\"malformed JSON from %s\", path))\n        return\n      end\n      onSuccess(decoded)\n    end,\n    error = function(err)\n      onError(\"network\", string.format(\"network error calling %s: %s\", path, tostring(err)))\n    end,\n  })\nend\n\n--- GET /api/auth/me -- verifies the token belongs to a real account.\nfunction PinPawApi:getAccount(onSuccess, onError)\n  self:_request(\"GET\", \"/api/auth/me\", nil, onSuccess, onError)\nend\n\n--- GET /api/pets -- every pet with deviceStatus, latestPosition and\n--- trackingInterval already embedded, so one call covers the whole integration.\nfunction PinPawApi:getPets(onSuccess, onError)\n  self:_request(\"GET\", \"/api/pets\", nil, function(data)\n    if type(data) ~= \"table\" then\n      onError(\"parse\", \"/api/pets did not return a list\")\n      return\n    end\n    onSuccess(data)\n  end, onError)\nend\n\n--- PUT /api/pets/{id}/tracking-interval -- push a new reporting interval.\nfunction PinPawApi:setTrackingInterval(petId, seconds, onSuccess, onError)\n  self:_request(\n    \"PUT\",\n    string.format(\"/api/pets/%s/tracking-interval\", tostring(petId)),\n    { trackingInterval = seconds },\n    onSuccess,\n    onError\n  )\nend\n",
+      "isMain": false,
+      "isOpen": false,
+      "name": "api",
+      "type": "lua"
+    },
+    {
+      "content": "--[[\nGeofencing helpers.\n\nThe Home Assistant integration deliberately implements no geofencing of its\nown: it publishes the pet as a device_tracker and lets Home Assistant Zones\ndrive the automations. This module is the Fibaro equivalent of that decision --\nHC3 already models zones in Settings > Location (GET /panels/location), each\nwith a name, coordinates and a radius, and exactly one of them flagged as home.\n\nSo rather than hardcoding a home coordinate in the QuickApp source, we read the\nzones the user already configured on their gateway. A pet is \"at home\" when it\nis inside the radius of the zone flagged home, and any other configured zone\n(\"Vet\", \"Park\", ...) is reported by name.\n\nManual homeLat/homeLon/homeRadius QuickApp variables act as an override for\ngateways where the location panel was never filled in.\n]]\n\nPinPawGeo = {}\n\nlocal EARTH_RADIUS_M = 6371000\n\n--- Great-circle distance in metres between two WGS84 points.\n---\n--- Uses the 2*asin(sqrt(a)) form of the haversine formula rather than the more\n--- commonly seen atan2 form: Lua 5.3 (which HC3 runs) dropped math.atan2 in\n--- favour of math.atan(y, x), so the atan2 spelling is not portable. The clamp\n--- guards against sqrt(a) drifting a hair above 1 through rounding on\n--- antipodal points, which would make asin return nan.\nfunction PinPawGeo.distance(lat1, lon1, lat2, lon2)\n  local dLat = math.rad(lat2 - lat1)\n  local dLon = math.rad(lon2 - lon1)\n  local a = math.sin(dLat / 2) ^ 2\n    + math.cos(math.rad(lat1)) * math.cos(math.rad(lat2)) * math.sin(dLon / 2) ^ 2\n  return 2 * EARTH_RADIUS_M * math.asin(math.min(1, math.sqrt(a)))\nend\n\n--- Read the zones configured on this gateway.\n--- Returns (zones, homeZone). homeZone is nil when the user never flagged one.\n---\n--- api.get is the QuickApp's in-process handle to the local HC3 REST API, so\n--- this needs no credentials. It is wrapped in pcall because a gateway with an\n--- empty location panel is a normal state, not an error worth crashing over.\nfunction PinPawGeo.loadZones()\n  local ok, locations = pcall(function()\n    return api.get(\"/panels/location\")\n  end)\n\n  if not ok or type(locations) ~= \"table\" then\n    return {}, nil\n  end\n\n  local zones, home = {}, nil\n  for _, loc in ipairs(locations) do\n    local lat, lon = tonumber(loc.latitude), tonumber(loc.longitude)\n    if lat and lon then\n      local zone = {\n        id = loc.id,\n        name = loc.name,\n        latitude = lat,\n        longitude = lon,\n        radius = tonumber(loc.radius) or 100,\n        home = loc.home == true,\n      }\n      zones[#zones + 1] = zone\n      if zone.home then\n        home = zone\n      end\n    end\n  end\n\n  return zones, home\nend\n\n--- Build the home zone from explicit QuickApp variables, when set.\nfunction PinPawGeo.manualHome(lat, lon, radius, name)\n  lat, lon = tonumber(lat), tonumber(lon)\n  if not lat or not lon then\n    return nil\n  end\n  return {\n    name = name or \"Home\",\n    latitude = lat,\n    longitude = lon,\n    radius = tonumber(radius) or 100,\n    home = true,\n    manual = true,\n  }\nend\n\n--- Innermost zone containing the point, or nil when the pet is outside them all.\n--- \"Innermost\" (smallest distance-to-centre) so a small zone nested inside a\n--- larger one wins, which is what a user who drew both would expect.\nfunction PinPawGeo.resolveZone(zones, lat, lon)\n  local best, bestDistance = nil, nil\n  for _, zone in ipairs(zones) do\n    local d = PinPawGeo.distance(zone.latitude, zone.longitude, lat, lon)\n    if d <= zone.radius and (bestDistance == nil or d < bestDistance) then\n      best, bestDistance = zone, d\n    end\n  end\n  return best, bestDistance\nend\n",
+      "isMain": false,
+      "isOpen": false,
+      "name": "geo",
+      "type": "lua"
+    },
+    {
+      "content": "--[[\nUI strings.\n\nThe Home Assistant integration ships translations/en.json and pl.json; this is\nthe QuickApp equivalent. Selected with the `language` QuickApp variable, and\nfalls back to English for any key a translation is missing.\n]]\n\nPinPawI18n = {}\n\nlocal STRINGS = {\n  en = {\n    atHome = \"At home\",\n    inZone = \"In zone: %s\",\n    away = \"Away (%d m from home)\",\n    awayNoHome = \"Position known (no home zone set)\",\n    noPosition = \"No position data yet\",\n    battery = \"Battery: %d%%\",\n    batteryCharging = \"Battery: %d%% (charging)\",\n    batteryUnknown = \"Battery: unknown\",\n    updated = \"Updated %s\",\n    never = \"never\",\n    noToken = \"Set the apiToken variable to a PinPaw token\",\n    badTokenFormat = \"apiToken does not look like a PinPaw token (ppw_pat_...)\",\n    authFailed = \"Token rejected - check apiToken\",\n    connectionError = \"Cannot reach PinPaw (%s)\",\n    noPets = \"No pets on this account\",\n    starting = \"Connecting to PinPaw...\",\n  },\n  pl = {\n    atHome = \"W domu\",\n    inZone = \"W strefie: %s\",\n    away = \"Poza domem (%d m od domu)\",\n    awayNoHome = \"Pozycja znana (brak strefy domowej)\",\n    noPosition = \"Brak danych o lokalizacji\",\n    battery = \"Bateria: %d%%\",\n    batteryCharging = \"Bateria: %d%% (ładowanie)\",\n    batteryUnknown = \"Bateria: brak danych\",\n    updated = \"Aktualizacja %s\",\n    never = \"nigdy\",\n    noToken = \"Ustaw zmienną apiToken na token PinPaw\",\n    badTokenFormat = \"apiToken nie wygląda na token PinPaw (ppw_pat_...)\",\n    authFailed = \"Token odrzucony — sprawdź apiToken\",\n    connectionError = \"Brak połączenia z PinPaw (%s)\",\n    noPets = \"Brak zwierząt na tym koncie\",\n    starting = \"Łączenie z PinPaw...\",\n  },\n}\n\n--- Look up `key` in `language`, falling back to English.\nfunction PinPawI18n.get(language, key)\n  local table_ = STRINGS[language] or STRINGS.en\n  return table_[key] or STRINGS.en[key] or key\nend\n\n--- Look up and string.format in one step.\nfunction PinPawI18n.format(language, key, ...)\n  return string.format(PinPawI18n.get(language, key), ...)\nend\n",
+      "isMain": false,
+      "isOpen": false,
+      "name": "i18n",
+      "type": "lua"
+    },
+    {
+      "content": "--[[\nChild devices -- one per pet, per measurement.\n\nThe Home Assistant integration exposes each pet as a device with several\nentities hanging off it. HC3's equivalent is a device controller QuickApp with\nchild devices, so the entity list is mirrored here one-for-one, plus the two\nvalues the HA integration gets for free from Zones (at-home / distance) which\non HC3 we have to compute ourselves.\n\n    HA entity                       role        HC3 child type\n    ---------------------------------------------------------------------\n    sensor.battery                  battery     com.fibaro.multilevelSensor\n    binary_sensor.online            online      com.fibaro.binarySensor\n    binary_sensor.charging          charging    com.fibaro.binarySensor\n    binary_sensor.battery_low       batteryLow  com.fibaro.binarySensor\n    (zone membership)               home        com.fibaro.binarySensor\n    (distance to zone)              distance    com.fibaro.multilevelSensor\n    -- latestPosition.motion        motion      com.fibaro.motionSensor\n\nAll roles share ONE Lua class. QuickApp:initChildDevices maps children back to\nclasses by device *type* after a restart, and several roles here share a type\n(three of them are com.fibaro.binarySensor), so a class-per-role scheme would\nnot survive a reboot -- HC3 could not tell which class to rebuild. Instead each\nchild stores its role in a QuickApp variable and dispatches on it.\n]]\n\n-- Battery level (%) below which the \"battery low\" child turns on. Matches\n-- LOW_BATTERY_THRESHOLD in the Home Assistant integration.\nPINPAW_LOW_BATTERY_THRESHOLD = 20\n\n--- The child roles to create for every pet, in display order.\nPINPAW_CHILD_ROLES = {\n  {\n    role = \"home\",\n    label = \"At home\",\n    type = \"com.fibaro.binarySensor\",\n  },\n  {\n    role = \"distance\",\n    label = \"Distance from home\",\n    type = \"com.fibaro.multilevelSensor\",\n    properties = { unit = \"m\" },\n  },\n  {\n    role = \"battery\",\n    label = \"Battery\",\n    type = \"com.fibaro.multilevelSensor\",\n    properties = { unit = \"%\" },\n    interfaces = { \"battery\" },\n  },\n  {\n    role = \"batteryLow\",\n    label = \"Battery low\",\n    type = \"com.fibaro.binarySensor\",\n  },\n  {\n    role = \"online\",\n    label = \"Online\",\n    type = \"com.fibaro.binarySensor\",\n  },\n  {\n    role = \"charging\",\n    label = \"Charging\",\n    type = \"com.fibaro.binarySensor\",\n  },\n  {\n    role = \"motion\",\n    label = \"Motion\",\n    type = \"com.fibaro.motionSensor\",\n  },\n}\n\nclass 'PinPawSensor' (QuickAppChild)\n\nfunction PinPawSensor:__init(device)\n  QuickAppChild.__init(self, device)\n  -- Set from the stored variables on restart. Freshly created children get\n  -- these assigned directly by the parent, because createChildDevice returns\n  -- before setVariable has had a chance to run.\n  self.petId = tonumber(self:getVariable(\"petId\"))\n  self.role = self:getVariable(\"role\")\nend\n\n-- state fields are pre-computed by the parent so every child sees exactly the\n-- same snapshot; a role whose value is missing this round is left untouched\n-- rather than being reset to a wrong default.\nlocal UPDATERS = {}\n\nUPDATERS.battery = function(child, state)\n  if state.batteryLevel == nil then\n    return\n  end\n  child:updateProperty(\"value\", state.batteryLevel)\n  -- Also as batteryLevel so the HC3 UI shows its native battery indicator.\n  child:updateProperty(\"batteryLevel\", state.batteryLevel)\nend\n\nUPDATERS.batteryLow = function(child, state)\n  if state.batteryLevel == nil then\n    return\n  end\n  child:updateProperty(\"value\", state.batteryLevel < PINPAW_LOW_BATTERY_THRESHOLD)\nend\n\nUPDATERS.online = function(child, state)\n  if state.online == nil then\n    return\n  end\n  child:updateProperty(\"value\", state.online)\nend\n\nUPDATERS.charging = function(child, state)\n  if state.charging == nil then\n    return\n  end\n  child:updateProperty(\"value\", state.charging)\nend\n\nUPDATERS.motion = function(child, state)\n  if state.motion == nil then\n    return\n  end\n  child:updateProperty(\"value\", state.motion)\nend\n\nUPDATERS.home = function(child, state)\n  if state.atHome == nil then\n    return\n  end\n  child:updateProperty(\"value\", state.atHome)\nend\n\nUPDATERS.distance = function(child, state)\n  if state.distance == nil then\n    return\n  end\n  child:updateProperty(\"value\", math.floor(state.distance + 0.5))\nend\n\n--- Apply one poll's snapshot to this child.\nfunction PinPawSensor:refresh(state)\n  local updater = UPDATERS[self.role]\n  if updater then\n    updater(self, state)\n  end\nend\n",
+      "isMain": false,
+      "isOpen": false,
+      "name": "children",
+      "type": "lua"
+    },
+    {
+      "content": "--[[\nPinPaw Pet Tracker -- Fibaro Home Center 3 QuickApp.\n\nPolls GET /api/pets on an interval and fans the result out to one set of child\ndevices per pet, so pets and their measurements show up as first class HC3\ndevices usable in blocks, scenes and the mobile app.\n\nLoad order matters: this file uses PinPawApi, PinPawGeo, PinPawI18n and\nPinPawSensor, so main must be the LAST file in the QuickApp.\n]]\n\nlocal DEFAULTS = {\n  baseUrl = PINPAW_DEFAULT_BASE_URL,\n  pollInterval = \"60\",\n  language = \"en\",\n  reverseGeocode = \"false\",\n  primaryPet = \"\",\n  homeLat = \"\",\n  homeLon = \"\",\n  homeRadius = \"\",\n}\n\n-- Polling floor. The tracker itself reports on its own schedule\n-- (trackingInterval), so hammering the API faster than this buys nothing.\nlocal MIN_POLL_INTERVAL = 15\n\n-- Re-read the HC3 location panel every N polls rather than every poll: zones\n-- change about once a year, and this keeps the local API call off the hot path.\nlocal ZONE_REFRESH_EVERY = 10\n\n-- Nominatim's usage policy caps automated use at 1 request/second and expects\n-- a descriptive User-Agent. We stay far below that: opt-in only, and never\n-- more than one lookup per this many seconds regardless of how often we poll.\nlocal GEOCODE_MIN_INTERVAL = 120\nlocal GEOCODE_USER_AGENT = \"fibaro-pinpaw/1.0 (+https://github.com/PinPaw-io/fibaro-pinpaw)\"\n\n--------------------------------------------------------------------------------\n-- Lifecycle\n--------------------------------------------------------------------------------\n\nfunction QuickApp:onInit()\n  self.config = self:readConfig()\n  self.halted = false\n  self.pollTimer = nil\n  self.zones, self.homeZone = {}, nil\n  self.pollCount = 0\n  self.lastGeocodeAt = 0\n  self.geocodeCache = {}\n  self.failureCount = 0\n\n  self:updateView(\"lblStatus\", \"text\", self:t(\"starting\"))\n\n  self:initChildDevices({\n    [\"com.fibaro.binarySensor\"] = PinPawSensor,\n    [\"com.fibaro.multilevelSensor\"] = PinPawSensor,\n    [\"com.fibaro.motionSensor\"] = PinPawSensor,\n  })\n  self.childIndex = self:indexChildren()\n\n  if self.config.token == \"\" then\n    self:halt(\"noToken\")\n    return\n  end\n  if not PinPawApi.looksLikeToken(self.config.token) then\n    self:halt(\"badTokenFormat\")\n    return\n  end\n\n  self.api = PinPawApi.new(self.config.baseUrl, self.config.token, self)\n  self:refreshZones()\n  self:loop()\nend\n\n--- Read QuickApp variables, writing defaults back so they appear in the UI\n--- ready to be edited instead of the user having to know the names.\nfunction QuickApp:readConfig()\n  local function read(name, default)\n    local value = self:getVariable(name)\n    if value == nil or value == \"\" then\n      if default ~= nil and default ~= \"\" then\n        self:setVariable(name, default)\n      end\n      return default or \"\"\n    end\n    return value\n  end\n\n  local pollInterval = tonumber(read(\"pollInterval\", DEFAULTS.pollInterval)) or 60\n\n  return {\n    token = self:getVariable(\"apiToken\") or \"\",\n    baseUrl = read(\"baseUrl\", DEFAULTS.baseUrl),\n    pollInterval = math.max(MIN_POLL_INTERVAL, math.floor(pollInterval)),\n    language = read(\"language\", DEFAULTS.language),\n    reverseGeocode = read(\"reverseGeocode\", DEFAULTS.reverseGeocode) == \"true\",\n    primaryPet = read(\"primaryPet\", DEFAULTS.primaryPet),\n    homeLat = read(\"homeLat\", DEFAULTS.homeLat),\n    homeLon = read(\"homeLon\", DEFAULTS.homeLon),\n    homeRadius = read(\"homeRadius\", DEFAULTS.homeRadius),\n  }\nend\n\nfunction QuickApp:t(key, ...)\n  if select(\"#\", ...) > 0 then\n    return PinPawI18n.format(self.config.language, key, ...)\n  end\n  return PinPawI18n.get(self.config.language, key)\nend\n\n--- Stop polling and park a message on the UI. Used for conditions that\n--- retrying cannot fix -- a missing or rejected token.\nfunction QuickApp:halt(messageKey)\n  self.halted = true\n  if self.pollTimer then\n    fibaro.clearTimeout(self.pollTimer)\n    self.pollTimer = nil\n  end\n  local message = self:t(messageKey)\n  self:error(message)\n  self:updateView(\"lblStatus\", \"text\", message)\n  self:updateProperty(\"log\", message)\nend\n\n--------------------------------------------------------------------------------\n-- Polling\n--------------------------------------------------------------------------------\n\nfunction QuickApp:loop()\n  if self.halted then\n    return\n  end\n  self:poll()\n  self.pollTimer = fibaro.setTimeout(self.config.pollInterval * 1000, function()\n    self:loop()\n  end)\nend\n\nfunction QuickApp:poll()\n  self.pollCount = self.pollCount + 1\n  if self.pollCount % ZONE_REFRESH_EVERY == 1 then\n    self:refreshZones()\n  end\n\n  self.api:getPets(function(pets)\n    self.failureCount = 0\n    self:onPets(pets)\n  end, function(kind, message)\n    self:onApiError(kind, message)\n  end)\nend\n\nfunction QuickApp:onApiError(kind, message)\n  if kind == \"auth\" then\n    self:halt(\"authFailed\")\n    return\n  end\n\n  self.failureCount = self.failureCount + 1\n  self:warning(string.format(\"PinPaw: %s\", message))\n  -- Only surface transient trouble on the UI once it stops looking transient,\n  -- so a single dropped request does not wipe a good last-known position.\n  if self.failureCount >= 3 then\n    self:updateView(\"lblStatus\", \"text\", self:t(\"connectionError\", kind))\n  end\nend\n\nfunction QuickApp:refreshZones()\n  local zones, home = PinPawGeo.loadZones()\n\n  -- Explicit coordinates win over the gateway's location panel.\n  local manual = PinPawGeo.manualHome(\n    self.config.homeLat,\n    self.config.homeLon,\n    self.config.homeRadius\n  )\n  if manual then\n    -- Demote the gateway's own home zone, otherwise \"at home\" could resolve\n    -- against the panel while \"distance\" is measured from the override.\n    for _, zone in ipairs(zones) do\n      zone.home = false\n    end\n    home = manual\n    zones[#zones + 1] = manual\n  elseif home and self.config.homeRadius ~= \"\" then\n    -- Radius override without moving the home coordinate.\n    home.radius = tonumber(self.config.homeRadius) or home.radius\n  end\n\n  self.zones, self.homeZone = zones, home\nend\n\n--------------------------------------------------------------------------------\n-- Applying data\n--------------------------------------------------------------------------------\n\nfunction QuickApp:onPets(pets)\n  if #pets == 0 then\n    self:updateView(\"lblStatus\", \"text\", self:t(\"noPets\"))\n    return\n  end\n\n  local primary = nil\n  for _, pet in ipairs(pets) do\n    if pet.id ~= nil then\n      local state = self:buildState(pet)\n      self:ensureChildren(pet)\n      self:refreshChildren(state)\n      if primary == nil or self:isPrimary(pet) then\n        primary = state\n      end\n    end\n  end\n\n  if primary then\n    self:updateMainView(primary)\n  end\nend\n\n--- Which pet drives the QuickApp's own labels. Defaults to the first one.\nfunction QuickApp:isPrimary(pet)\n  local wanted = self.config.primaryPet\n  if wanted == \"\" then\n    return false\n  end\n  return tostring(pet.id) == wanted or pet.name == wanted\nend\n\n--- Flatten one pet into the snapshot the children and the UI both consume.\nfunction QuickApp:buildState(pet)\n  local position = pet.latestPosition or {}\n  local lat = tonumber(position.latitude)\n  local lon = tonumber(position.longitude)\n\n  local state = {\n    petId = pet.id,\n    name = pet.name or (\"Pet \" .. tostring(pet.id)),\n    latitude = lat,\n    longitude = lon,\n    batteryLevel = tonumber(position.batteryLevel),\n    charging = position.charging,\n    motion = position.motion,\n    address = position.address,\n    speed = tonumber(position.speed),\n    trackingInterval = tonumber(pet.trackingInterval),\n    lastUpdate = pet.deviceLastUpdate,\n  }\n\n  -- deviceStatus is the authoritative online flag when present, exactly as in\n  -- the Home Assistant integration; latestPosition.online is the fallback.\n  if pet.deviceStatus ~= nil then\n    state.online = pet.deviceStatus == \"online\"\n  else\n    state.online = position.online\n  end\n\n  if lat and lon then\n    local zone, zoneDistance = PinPawGeo.resolveZone(self.zones, lat, lon)\n    state.zone = zone\n    state.zoneDistance = zoneDistance\n    state.atHome = zone ~= nil and zone.home == true\n\n    if self.homeZone then\n      state.distance = PinPawGeo.distance(\n        self.homeZone.latitude,\n        self.homeZone.longitude,\n        lat,\n        lon\n      )\n    end\n  end\n\n  return state\nend\n\nfunction QuickApp:refreshChildren(state)\n  for _, spec in ipairs(PINPAW_CHILD_ROLES) do\n    local child = self.childIndex[self:childKey(state.petId, spec.role)]\n    if child then\n      child:refresh(state)\n    end\n  end\nend\n\n--------------------------------------------------------------------------------\n-- Child bookkeeping\n--------------------------------------------------------------------------------\n\nfunction QuickApp:childKey(petId, role)\n  return tostring(petId) .. \":\" .. role\nend\n\n--- Rebuild the pet/role -> child map from the children HC3 restored for us.\nfunction QuickApp:indexChildren()\n  local index = {}\n  for _, child in pairs(self.childDevices) do\n    if child.petId and child.role then\n      index[self:childKey(child.petId, child.role)] = child\n    end\n  end\n  return index\nend\n\nfunction QuickApp:ensureChildren(pet)\n  for _, spec in ipairs(PINPAW_CHILD_ROLES) do\n    local key = self:childKey(pet.id, spec.role)\n    if not self.childIndex[key] then\n      local petName = pet.name or (\"Pet \" .. tostring(pet.id))\n      local child = self:createChildDevice({\n        name = string.format(\"%s - %s\", petName, spec.label),\n        type = spec.type,\n        initialProperties = spec.properties or {},\n        initialInterfaces = spec.interfaces or {},\n      }, PinPawSensor)\n\n      child:setVariable(\"petId\", tostring(pet.id))\n      child:setVariable(\"role\", spec.role)\n      -- The constructor ran before those variables existed, so seed the\n      -- in-memory copies too; the stored ones take over after a restart.\n      child.petId = pet.id\n      child.role = spec.role\n\n      self.childIndex[key] = child\n      self:debug(string.format(\"PinPaw: created child '%s'\", spec.role))\n    end\n  end\nend\n\n--------------------------------------------------------------------------------\n-- QuickApp view\n--------------------------------------------------------------------------------\n\nfunction QuickApp:updateMainView(state)\n  self:updateView(\"lblStatus\", \"text\", self:statusText(state))\n  self:updateView(\"lblBattery\", \"text\", self:batteryText(state))\n  self:updateView(\"lblUpdated\", \"text\", self:t(\"updated\", self:formatTimestamp(state.lastUpdate)))\n  self:updateProperty(\"log\", self:statusText(state))\n  self:resolveAddress(state)\nend\n\nfunction QuickApp:statusText(state)\n  if not state.latitude or not state.longitude then\n    return self:t(\"noPosition\")\n  end\n  if state.atHome then\n    return self:t(\"atHome\")\n  end\n  if state.zone then\n    return self:t(\"inZone\", state.zone.name or \"?\")\n  end\n  if state.distance then\n    return self:t(\"away\", math.floor(state.distance + 0.5))\n  end\n  return self:t(\"awayNoHome\")\nend\n\nfunction QuickApp:batteryText(state)\n  if state.batteryLevel == nil then\n    return self:t(\"batteryUnknown\")\n  end\n  local key = state.charging and \"batteryCharging\" or \"battery\"\n  return self:t(key, math.floor(state.batteryLevel + 0.5))\nend\n\nfunction QuickApp:formatTimestamp(value)\n  if value == nil then\n    return self:t(\"never\")\n  end\n  if type(value) == \"number\" then\n    -- Backends vary between seconds and milliseconds since the epoch.\n    local seconds = value > 1e12 and math.floor(value / 1000) or math.floor(value)\n    return os.date(\"%Y-%m-%d %H:%M:%S\", seconds)\n  end\n  -- ISO 8601 -- trim to \"YYYY-MM-DD HH:MM:SS\" for the narrow label.\n  return (tostring(value):gsub(\"T\", \" \"):sub(1, 19))\nend\n\n--------------------------------------------------------------------------------\n-- Address\n--------------------------------------------------------------------------------\n\n--- Prefer the address the backend already resolved; fall back to OpenStreetMap\n--- only when the user opted in, and never faster than GEOCODE_MIN_INTERVAL.\nfunction QuickApp:resolveAddress(state)\n  if type(state.address) == \"string\" and state.address ~= \"\" then\n    self:updateView(\"lblLocation\", \"text\", state.address)\n    return\n  end\n\n  if not state.latitude or not state.longitude then\n    self:updateView(\"lblLocation\", \"text\", \"-\")\n    return\n  end\n\n  local coordinateText = string.format(\"%.5f, %.5f\", state.latitude, state.longitude)\n\n  if not self.config.reverseGeocode then\n    self:updateView(\"lblLocation\", \"text\", coordinateText)\n    return\n  end\n\n  local cacheKey = string.format(\"%.4f/%.4f\", state.latitude, state.longitude)\n  if self.geocodeCache[cacheKey] then\n    self:updateView(\"lblLocation\", \"text\", self.geocodeCache[cacheKey])\n    return\n  end\n\n  local now = os.time()\n  if now - self.lastGeocodeAt < GEOCODE_MIN_INTERVAL then\n    self:updateView(\"lblLocation\", \"text\", coordinateText)\n    return\n  end\n  self.lastGeocodeAt = now\n\n  self:updateView(\"lblLocation\", \"text\", coordinateText)\n  self:geocode(state.latitude, state.longitude, cacheKey, coordinateText)\nend\n\nfunction QuickApp:geocode(lat, lon, cacheKey, fallback)\n  self.geocodeHttp = self.geocodeHttp or net.HTTPClient({ timeout = 10000 })\n\n  local url = string.format(\n    \"https://nominatim.openstreetmap.org/reverse?format=json&lat=%f&lon=%f&zoom=18&addressdetails=1\",\n    lat,\n    lon\n  )\n\n  self.geocodeHttp:request(url, {\n    options = {\n      method = \"GET\",\n      headers = {\n        [\"User-Agent\"] = GEOCODE_USER_AGENT,\n        [\"Accept\"] = \"application/json\",\n      },\n    },\n    success = function(response)\n      if tonumber(response.status) ~= 200 then\n        return\n      end\n      local ok, data = pcall(json.decode, response.data)\n      if not ok or type(data) ~= \"table\" or type(data.address) ~= \"table\" then\n        return\n      end\n\n      local a = data.address\n      local street = a.road or a.pedestrian or a.path\n      local city = a.city or a.town or a.village\n      local text\n\n      if street then\n        text = street\n        if a.house_number then\n          text = text .. \" \" .. a.house_number\n        end\n        if city then\n          text = text .. \", \" .. city\n        end\n      else\n        text = data.display_name or fallback\n      end\n\n      self.geocodeCache[cacheKey] = text\n      self:updateView(\"lblLocation\", \"text\", text)\n    end,\n    error = function(err)\n      self:debug(string.format(\"PinPaw: reverse geocoding failed: %s\", tostring(err)))\n    end,\n  })\nend\n\n--------------------------------------------------------------------------------\n-- Actions (UI button and scene-callable)\n--------------------------------------------------------------------------------\n\nfunction QuickApp:onRefreshClicked()\n  if self.halted then\n    return\n  end\n  self:poll()\nend\n\n--- Change a tracker's reporting interval, the QuickApp counterpart of the\n--- number entity in the Home Assistant integration. Call from a scene with:\n---   fibaro.call(<quickAppId>, \"setPetTrackingInterval\", <petId>, <seconds>)\nfunction QuickApp:setPetTrackingInterval(petId, seconds)\n  if not self.api then\n    return\n  end\n\n  local value = tonumber(seconds)\n  if not value then\n    self:error(\"PinPaw: setPetTrackingInterval needs a numeric interval\")\n    return\n  end\n\n  self.api:setTrackingInterval(petId, math.floor(value), function()\n    self:debug(string.format(\"PinPaw: interval for pet %s set to %ds\", tostring(petId), value))\n    self:poll()\n  end, function(kind, message)\n    self:onApiError(kind, message)\n  end)\nend\n",
+      "isMain": true,
+      "isOpen": true,
+      "name": "main",
+      "type": "lua"
+    }
+  ],
+  "initialInterfaces": [
+    "quickApp"
+  ],
+  "initialProperties": {
+    "quickAppVariables": [
+      {
+        "name": "apiToken",
+        "value": ""
+      },
+      {
+        "name": "baseUrl",
+        "value": "https://api.pinpaw.io"
+      },
+      {
+        "name": "pollInterval",
+        "value": "60"
+      },
+      {
+        "name": "language",
+        "value": "en"
+      },
+      {
+        "name": "reverseGeocode",
+        "value": "false"
+      },
+      {
+        "name": "primaryPet",
+        "value": ""
+      },
+      {
+        "name": "homeLat",
+        "value": ""
+      },
+      {
+        "name": "homeLon",
+        "value": ""
+      },
+      {
+        "name": "homeRadius",
+        "value": ""
+      }
+    ],
+    "typeTemplateInitialized": true,
+    "uiCallbacks": [
+      {
+        "callback": "onRefreshClicked",
+        "eventType": "onReleased",
+        "name": "btnRefresh"
+      }
+    ],
+    "viewLayout": {
+      "$jason": {
+        "body": {
+          "header": {
+            "style": {
+              "height": "0"
+            },
+            "title": "quickApp_device_PinPaw"
+          },
+          "sections": {
+            "items": [
+              {
+                "components": [
+                  {
+                    "eventBinding": {},
+                    "name": "lblStatus",
+                    "style": {
+                      "weight": "1.2"
+                    },
+                    "text": "PinPaw",
+                    "type": "label",
+                    "visible": true
+                  },
+                  {
+                    "style": {
+                      "weight": "0.5"
+                    },
+                    "type": "space"
+                  }
+                ],
+                "style": {
+                  "weight": "1.2"
+                },
+                "type": "vertical"
+              },
+              {
+                "components": [
+                  {
+                    "eventBinding": {},
+                    "name": "lblLocation",
+                    "style": {
+                      "weight": "1.2"
+                    },
+                    "text": "-",
+                    "type": "label",
+                    "visible": true
+                  },
+                  {
+                    "style": {
+                      "weight": "0.5"
+                    },
+                    "type": "space"
+                  }
+                ],
+                "style": {
+                  "weight": "1.2"
+                },
+                "type": "vertical"
+              },
+              {
+                "components": [
+                  {
+                    "eventBinding": {},
+                    "name": "lblBattery",
+                    "style": {
+                      "weight": "1.2"
+                    },
+                    "text": "-",
+                    "type": "label",
+                    "visible": true
+                  },
+                  {
+                    "style": {
+                      "weight": "0.5"
+                    },
+                    "type": "space"
+                  }
+                ],
+                "style": {
+                  "weight": "1.2"
+                },
+                "type": "vertical"
+              },
+              {
+                "components": [
+                  {
+                    "eventBinding": {},
+                    "name": "lblUpdated",
+                    "style": {
+                      "weight": "1.2"
+                    },
+                    "text": "-",
+                    "type": "label",
+                    "visible": true
+                  },
+                  {
+                    "style": {
+                      "weight": "0.5"
+                    },
+                    "type": "space"
+                  }
+                ],
+                "style": {
+                  "weight": "1.2"
+                },
+                "type": "vertical"
+              },
+              {
+                "components": [
+                  {
+                    "eventBinding": {
+                      "onReleased": [
+                        {
+                          "params": {
+                            "actionName": "UIAction",
+                            "args": [
+                              "onReleased",
+                              "btnRefresh"
+                            ]
+                          },
+                          "type": "deviceAction"
+                        }
+                      ]
+                    },
+                    "name": "btnRefresh",
+                    "style": {
+                      "weight": "1.2"
+                    },
+                    "text": "Refresh",
+                    "type": "button",
+                    "visible": true
+                  },
+                  {
+                    "style": {
+                      "weight": "0.5"
+                    },
+                    "type": "space"
+                  }
+                ],
+                "style": {
+                  "weight": "1.2"
+                },
+                "type": "vertical"
+              }
+            ]
+          }
+        },
+        "head": {
+          "title": "quickApp_device_PinPaw"
+        }
+      }
+    }
+  },
+  "name": "PinPaw",
+  "type": "com.fibaro.deviceController"
+}

@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Lua
+        run: sudo apt-get update && sudo apt-get install -y lua5.3
+
+      # HC3 runs Lua 5.3, so the syntax gate uses 5.3 rather than whatever
+      # happens to be newest.
+      - name: Check Lua syntax
+        run: |
+          for file in src/*.lua tests/*.lua; do
+            luac5.3 -p "$file"
+          done
+
+      - name: Run tests
+        run: lua5.3 tests/run.lua
+
+      - name: Verify dist/pinpaw.fqa is in sync with src/
+        run: python3 tools/build_fqa.py --check
