@@ -3,12 +3,12 @@
 QuickApp integration for the [PinPaw](https://pinpaw.io) GPS pet tracker on
 Fibaro Home Center 3. It is the Fibaro counterpart of the
 [Home Assistant integration](https://github.com/PinPaw-io/homeassistant-pinpaw)
-and exposes the same measurements, as native HC3 child devices you can use in
-blocks, scenes and the mobile app.
+and exposes the same measurements and mode controls, as native HC3 child
+devices you can use in blocks, scenes and the mobile app.
 
 > **Status: experimental. Not yet verified on real hardware.**
 > The API client, geofencing, state mapping and error handling are covered by
-> 68 automated tests that run against a stubbed HC3 runtime (`lua tests/run.lua`),
+> 106 automated tests that run against a stubbed HC3 runtime (`lua tests/run.lua`),
 > but the package has not yet been installed on a physical Home Center 3.
 > Expect rough edges around the HC3-specific parts, the `.fqa` import and the
 > UI layout in particular. Please report what you hit.
@@ -26,10 +26,42 @@ One QuickApp per account, and a set of child devices per pet:
 | Online | `com.fibaro.binarySensor` | Tracker reachable |
 | Charging | `com.fibaro.binarySensor` | On the charger |
 | Motion | `com.fibaro.motionSensor` | Device reports movement |
+| Reported lost | `com.fibaro.binarySensor` | Pet is marked lost in the app |
 
-The QuickApp's own panel shows status, address, battery and last update for one
-pet, with a refresh button. **All** pets on the account get child devices; set
-`primaryPet` to choose which one the panel follows.
+And a switch per mode the tracker supports:
+
+| Child device | HC3 type | What it does |
+| --- | --- | --- |
+| Car mode | `com.fibaro.binarySwitch` | Suspends walk recording while the pet is riding along |
+| Manual walk mode | `com.fibaro.binarySwitch` | On for manual walks, off for automatic detection |
+| Walk recording | `com.fibaro.binarySwitch` | Starts and stops a walk. Manual mode only |
+| Live tracking | `com.fibaro.binarySwitch` | On for live tracking, off for the daily schedule |
+| Sleeping mode | `com.fibaro.binarySwitch` | Puts the tracker to sleep. Momentary |
+| Light | `com.fibaro.binarySwitch` | The tracker's locator light |
+| Sound | `com.fibaro.binarySwitch` | The tracker's locator buzzer |
+
+Car mode, manual walk mode and walk recording are backend state, so every
+tracker gets them. The rest are device commands and are only created for
+trackers whose protocol advertises them, so a tracker with no LED gets no light
+child rather than one that fails on every tap.
+
+**Sleeping mode is one-way.** Waking a sleeping tracker happens over Bluetooth
+with the phone next to it and never through the API, so the child is momentary:
+it goes back off once the command is out, and switching it off does nothing on
+purpose.
+
+**Walk recording only works in manual mode.** The backend refuses it in
+automatic mode, where recording is always on and not yours to control. The
+QuickApp logs why rather than sending a request it knows will fail.
+
+**Light and sound lag a little.** Their state comes from the tracker's last
+heartbeat (`GET /api/device-states/my-pets`), which is polled alongside the pet
+list, but only when a tracker on the account advertises those commands.
+
+The QuickApp's own panel shows status, address, battery, the primary pet's
+modes and last update, with a refresh button and a sleeping-mode button. **All**
+pets on the account get child devices; set `primaryPet` to choose which one the
+panel follows.
 
 ## Geofencing uses your gateway's zones
 
@@ -102,22 +134,31 @@ rate-limits itself to one lookup per two minutes and caches by rounded
 coordinates, but that decision should still be yours. For heavy use, run your
 own Nominatim or a commercial geocoder.
 
-## Controlling the reporting interval
+## Driving it from a scene
 
-The Home Assistant integration exposes the tracker's reporting interval as a
-number entity. On HC3 it is a QuickApp action, callable from any scene:
+Every switch is also a QuickApp action, callable from any scene. `7` below is
+the PinPaw pet id.
 
 ```lua
--- 7 is the PinPaw pet id, 120 is the new interval in seconds
+-- Reporting interval, in seconds. Shorter means fresher positions and
+-- shorter battery life.
 fibaro.call(<quickAppDeviceId>, "setPetTrackingInterval", 7, 120)
-```
 
-Shorter intervals mean fresher positions and shorter battery life.
+fibaro.call(<quickAppDeviceId>, "setPetCarMode", 7, true)
+fibaro.call(<quickAppDeviceId>, "setPetManualWalkMode", 7, true)
+fibaro.call(<quickAppDeviceId>, "setPetWalkActive", 7, true)   -- manual mode only
+fibaro.call(<quickAppDeviceId>, "setPetLiveTracking", 7, true)
+fibaro.call(<quickAppDeviceId>, "setPetLed", 7, true)
+fibaro.call(<quickAppDeviceId>, "setPetSound", 7, false)
+
+-- One-way, see above
+fibaro.call(<quickAppDeviceId>, "sleepPet", 7)
+```
 
 ## Development
 
 ```bash
-lua tests/run.lua              # 68 logic tests against a stubbed HC3 runtime
+lua tests/run.lua              # 106 logic tests against a stubbed HC3 runtime
 python3 tools/build_fqa.py     # rebuild dist/pinpaw.fqa from src/
 python3 tools/build_fqa.py --check   # fail if dist/ is stale
 ```
@@ -132,7 +173,7 @@ caveat at the top of this file still stands.
 src/api.lua        REST client (Bearer PAT, 401/403 handled separately)
 src/geo.lua        Haversine + HC3 location-panel zones
 src/i18n.lua       Panel strings (en/pl)
-src/children.lua   Child device roles and their updaters
+src/children.lua   Child device roles, their updaters and the switch writers
 src/main.lua       Lifecycle, polling, state mapping, UI  ← must load last
 ```
 
@@ -145,6 +186,11 @@ src/main.lua       Lifecycle, polling, state mapping, UI  ← must load last
 - **Geofencing is computed here.** Home Assistant gets zone membership for free
   from `device_tracker` + Zones; on HC3 the QuickApp does the distance maths
   against the location panel itself.
+- **Walk recording mode is two states, not a dropdown.** Home Assistant has a
+  `select` entity; HC3 has no equivalent child type, so it is a single "manual
+  walk mode" switch instead.
+- **Tracking mode has no child device.** HC3 has no enum sensor, so it is shown
+  on the QuickApp panel rather than as a device of its own.
 
 ## Licence
 

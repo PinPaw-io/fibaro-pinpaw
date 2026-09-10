@@ -21,6 +21,17 @@ PINPAW_TOKEN_PREFIX = "ppw_pat_"
 
 PINPAW_DEFAULT_BASE_URL = "https://api.pinpaw.io"
 
+--- Device command types the QuickApp sends.
+PINPAW_CMD = {
+  liveTracking = "LIVE_TRACKING",
+  defaultTracking = "DEFAULT_TRACKING",
+  savingTracking = "SAVING_TRACKING",
+  ledOn = "LED_SWITCH_ON",
+  ledOff = "LED_SWITCH_OFF",
+  soundOn = "SOUND_SWITCH_ON",
+  soundOff = "SOUND_SWITCH_OFF",
+}
+
 local HTTP_TIMEOUT_MS = 15000
 
 --- Create a client. `logger` is optional and only needs a :debug(...) method.
@@ -108,6 +119,65 @@ function PinPawApi:getPets(onSuccess, onError)
     end
     onSuccess(data)
   end, onError)
+end
+
+--- GET /api/device-states/my-pets -- the last heartbeat for every visible pet.
+--- The only place the light and sound state lives; /api/pets omits it.
+function PinPawApi:getDeviceStates(onSuccess, onError)
+  self:_request("GET", "/api/device-states/my-pets", nil, function(data)
+    if type(data) ~= "table" then
+      onError("parse", "/api/device-states/my-pets did not return a list")
+      return
+    end
+    onSuccess(data)
+  end, onError)
+end
+
+--- PUT /api/pets/{id}/car-mode -- the pet is riding along, so no walk is recorded.
+function PinPawApi:setCarMode(petId, enabled, onSuccess, onError)
+  self:_request(
+    "PUT",
+    string.format("/api/pets/%s/car-mode", tostring(petId)),
+    { enabled = enabled },
+    onSuccess,
+    onError
+  )
+end
+
+--- PUT /api/pets/{id}/walk-recording-mode -- "AUTO" or "MANUAL".
+function PinPawApi:setWalkRecordingMode(petId, mode, onSuccess, onError)
+  self:_request(
+    "PUT",
+    string.format("/api/pets/%s/walk-recording-mode", tostring(petId)),
+    { mode = mode },
+    onSuccess,
+    onError
+  )
+end
+
+--- PUT /api/pets/{id}/walk-active -- start or stop a walk. Manual mode only.
+function PinPawApi:setWalkActive(petId, enabled, onSuccess, onError)
+  self:_request(
+    "PUT",
+    string.format("/api/pets/%s/walk-active", tostring(petId)),
+    { enabled = enabled },
+    onSuccess,
+    onError
+  )
+end
+
+--- POST /api/pets/{id}/commands/{command} -- fire and forget.
+--- The backend also offers a /sync variant that blocks up to 30s waiting for the
+--- tracker to acknowledge, which is twice this client's own timeout. The result
+--- of the command shows up in the next poll instead.
+function PinPawApi:sendCommand(petId, command, onSuccess, onError)
+  self:_request(
+    "POST",
+    string.format("/api/pets/%s/commands/%s", tostring(petId), command),
+    nil,
+    onSuccess,
+    onError
+  )
 end
 
 --- PUT /api/pets/{id}/tracking-interval -- push a new reporting interval.

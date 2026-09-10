@@ -26,6 +26,16 @@ local STRINGS = {
     connectionError = "Cannot reach PinPaw (%s)",
     noPets = "No pets on this account",
     starting = "Connecting to PinPaw...",
+    modeLive = "Live tracking",
+    modeSleeping = "Sleeping",
+    modeDaily = "Daily tracking",
+    modeUnknown = "Tracking mode unknown",
+    walkAuto = "Automatic walks",
+    walkManual = "Manual walks",
+    walkRecording = "Recording a walk",
+    carMode = "Car mode",
+    walkManualOnly = "PinPaw: walk recording can only be started or stopped in manual mode. "
+      .. "Turn on the Manual walk mode switch first.",
   },
   pl = {
     atHome = "W domu",
@@ -44,6 +54,16 @@ local STRINGS = {
     connectionError = "Brak połączenia z PinPaw (%s)",
     noPets = "Brak zwierząt na tym koncie",
     starting = "Łączenie z PinPaw...",
+    modeLive = "Śledzenie na żywo",
+    modeSleeping = "Uśpienie",
+    modeDaily = "Śledzenie codzienne",
+    modeUnknown = "Nieznany tryb śledzenia",
+    walkAuto = "Spacery automatyczne",
+    walkManual = "Spacery ręczne",
+    walkRecording = "Nagrywanie spaceru",
+    carMode = "Tryb samochodowy",
+    walkManualOnly = "PinPaw: nagrywanie spaceru można włączyć lub wyłączyć tylko w trybie "
+      .. "ręcznym. Najpierw włącz przełącznik Manual walk mode.",
   },
 }
 
