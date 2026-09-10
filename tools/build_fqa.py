@@ -54,12 +54,14 @@ UI_ROWS = [
     ("lblStatus", "label", "PinPaw"),
     ("lblLocation", "label", "-"),
     ("lblBattery", "label", "-"),
+    ("lblModes", "label", "-"),
     ("lblUpdated", "label", "-"),
     ("btnRefresh", "button", "Refresh"),
+    ("btnSleep", "button", "Sleeping mode"),
 ]
 
 # Button name -> QuickApp method invoked when it is released.
-UI_CALLBACKS = {"btnRefresh": "onRefreshClicked"}
+UI_CALLBACKS = {"btnRefresh": "onRefreshClicked", "btnSleep": "onSleepClicked"}
 
 
 def _label(name: str, text: str) -> dict:
